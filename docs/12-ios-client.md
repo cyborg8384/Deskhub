@@ -167,13 +167,39 @@ STREAMING.
 
 - **Touch → mouse** — `TouchInputView` (`client/ios/app/swift/TouchInputView.swift`) is a
   *trackpad*, not direct touch: a visible cursor (SF Symbol `cursorarrow`) is moved by pan
-  deltas and clamped to the aspect-fit video rect; coordinates sent are normalized 0..65535
-  within that rect. Gestures: drag = move cursor; single tap = left click (waits for the
+  deltas. Gestures: drag = move cursor; single tap = left click (waits for the
   double-tap window to fail); double tap = right click; long-press-then-drag = hold left
   button and drag, released on lift. A move is re-sent immediately before every click so
   clicks land under the visible cursor. The overlay fills the middle row of the screen —
   letterbox included — but not the status/button bars above and below it, so a finger landing
   on a button no longer jogs the cursor. It is mounted whenever the session is streaming.
+
+  Since the zoom work (2026-07-29) the cursor is stored in **content space** — a 0..1 point on
+  the *host's* screen — and its on-screen position is derived through `VideoTransform`. What
+  is sent is simply `cursor × 65535`, so changing zoom or pan never nudges the host pointer,
+  and a finger delta divided by the *zoomed* frame width makes the cursor move slower the
+  further you zoom in (the precision mode zooming exists to provide).
+- **Pinch zoom / pan** (`VideoZoom.swift`, added 2026-07-29) — two fingers pinch to magnify the
+  decoded frame (1× fit … 5×) and drag to move the viewport; a `Fit 2.3×` button in the bottom
+  bar appears only while zoomed and returns to fit. Nothing is sent to the host: this is purely
+  client-side magnification of pixels already received, since the agent always streams the
+  source at its native resolution (`AgentLoop` builds the offer straight from the source size
+  and ignores `HELLO.maxWidth/maxHeight`). `VideoTransform` is a direct port of the Android
+  `VideoZoom.kt` — same `fitRect`/`videoRect` formulas, same auto-pan (`ensureVisible`) when
+  the cursor nears an edge and same reverse rule (`clampToVisible`) that lets a hand-panned
+  viewport push the cursor instead of yanking the view back. Two things differ from Android:
+  - **No clipping host view is needed.** Android has to build a `FrameLayout` because a
+    `SurfaceView` is a hole punched in the window that no one clips for it. Here the frame
+    lives in an `AVSampleBufferDisplayLayer` — an ordinary `CALayer` — so zoom/pan is
+    `.scaleEffect` + `.offset` on the video view and SwiftUI's `.clipped()` is enough. The
+    sample buffers keep their native resolution; only the layer transform changes.
+  - **Gesture arbitration is UIKit's.** A `UIPinchGestureRecognizer` plus a two-finger
+    `UIPanGestureRecognizer` (both delegating to the view) are allowed to recognize
+    simultaneously with each other *and* with an in-flight one-finger drag — the default
+    would block a pinch started mid-drag. The one-finger paths then check `isTransforming`
+    and stop moving the cursor while a viewport gesture runs, which is the iOS equivalent of
+    Android's `multiTouch` latch. Taps and long-press need exactly one touch, so UIKit
+    already rejects them during a pinch.
 - **Virtual keyboard** — `KeyInputView` (`client/ios/app/swift/KeyInputView.swift`) is an
   invisible `UIKeyInput` view (ASCII keyboard, autocorrect off) toggled by the HUD keyboard
   button; a transparent accessory bar adds a "Done" dismiss button. Each typed scalar goes to
@@ -204,7 +230,13 @@ STREAMING.
 
 ## 7. Known limitations (as coded)
 
-- **No scroll**: no gesture maps to mouse wheel; only move/left/right/drag exist.
+- **No scroll**: no gesture maps to mouse wheel; only move/left/right/drag exist (pinch zoom
+  does exist, see Input — it is a client-side view transform, not an input event).
+- **Zoom is client-side only**: it magnifies frames already decoded, so past ~1:1 with the
+  device's pixels it stops recovering detail and starts interpolating (hence the 5× cap).
+  Streaming only the visible region — host-side crop, real detail at any magnification, less
+  bitrate — would need a new wire message plus a crop stage before NVENC and an encoder
+  rebuild per zoom step; deliberately not done. Rationale in `VideoZoom.swift`.
 - **Relative mouse is a stub**: `dh_mouse_move_rel` / `QueueMouseMoveRel` exist for an
   FPS-style pointer-lock mode, but no UI calls them (the "Lock" button was removed).
 - **US-ASCII typing only**: `CharToKeyChord` covers the US layout; other characters are

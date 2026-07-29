@@ -256,8 +256,9 @@ line still shows the same numbers as text.
   capped at 5×). Streaming only the visible region — host-side crop, real detail at any
   magnification, less bitrate — would need a new wire message plus a crop stage before NVENC
   and an encoder rebuild per zoom step; deliberately not done. Rationale in `VideoZoom.kt`.
-- The zoom gesture is **iOS-less for now**: `TouchInputView.swift` still has no pinch
-  (`isMultipleTouchEnabled = false`), so the two mobile clients differ here until it is ported.
+  The iOS client has the same feature (`client/ios/app/swift/VideoZoom.swift`, same formulas);
+  it needs no clipping host view because its frame lives in a `CALayer` — see
+  `12-ios-client.md`.
 - No host discovery (no mDNS/broadcast); the address is typed by hand (the last one is pre-filled).
 - One session at a time by design: a single global `ClientLoop` behind JNI.
 - No pause/resume — backgrounding terminates the session (see Lifecycle).

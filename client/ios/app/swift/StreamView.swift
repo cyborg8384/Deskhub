@@ -23,6 +23,11 @@
 //   Host chia sẻ TẤT CẢ màn hình. Nút "Display" (chỉ hiện khi có >1 nguồn) đổi tại
 //   chỗ qua SessionModel.switchSource — không phải thoát phiên rồi kết nối lại.
 //
+// ZOOM (2026-07-29)
+//   Hai ngón để phóng to và rê khung nhìn. Trạng thái + phép toán nằm ở VideoZoom.swift
+//   (VideoTransform), dùng CHUNG cho khung hình và trackpad — hai bên tự tính riêng là
+//   lệch nhau ngay. Ô giữa đo viewport một lần (GeometryReader) rồi truyền xuống cả hai.
+//
 // Video sống trong AVSampleBufferDisplayLayer (qua VideoLayerView); SwiftUI chỉ vẽ
 // phần chrome, cập nhật mỗi 500ms từ SessionModel.
 // =============================================================================
@@ -63,6 +68,9 @@ struct StreamView: View {
     @State private var layer: AVSampleBufferDisplayLayer?
     @State private var keyboardOn = false
     @State private var pickerOpen = false
+    // Zoom/pan của khung hình. Ở ĐÂY chứ không nằm trong TouchInputView vì cả khung
+    // hình lẫn trackpad phải nhìn vào CÙNG một khung — xem VideoZoom.swift.
+    @State private var transform = VideoTransform()
 
     private var streaming: Bool { model.phase == .streaming }
 
@@ -94,6 +102,9 @@ struct StreamView: View {
             UIApplication.shared.isIdleTimerDisabled = true
             model.streamViewAppeared()
         }
+        // Đổi màn hình = nguồn khác, có thể khác cả tỉ lệ; giữ zoom cũ là vừa đổi
+        // xong đã thấy một góc lạ hoắc.
+        .onChange(of: model.currentSourceId) { _, _ in transform.reset() }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
             keyboardOn = false
@@ -133,33 +144,52 @@ struct StreamView: View {
     // MARK: - Ô giữa: video
 
     private var videoArea: some View {
-        ZStack {
-            VideoLayerView { newLayer in
-                layer = newLayer
-                DeskhubClient.setLayer(newLayer)
-            }
-            .aspectRatio(aspectRatio, contentMode: .fit)
+        // GeometryReader chỉ để ĐO: viewport là thứ VideoTransform cần để dựng khung,
+        // và đo ở đây thì cả khung hình lẫn trackpad dùng chung đúng một con số.
+        GeometryReader { geo in
+            ZStack {
+                VideoLayerView { newLayer in
+                    layer = newLayer
+                    DeskhubClient.setLayer(newLayer)
+                }
+                .aspectRatio(aspectRatio, contentMode: .fit)
+                // Zoom = phép biến hình của chính layer video, không đụng gì tới đường
+                // giải mã: CMSampleBuffer vẫn nguyên độ phân giải, bộ ghép hình lấy
+                // mẫu ở tỉ lệ cuối. scaleEffect neo ở TÂM — trùng công thức videoRect.
+                .scaleEffect(transform.zoom)
+                .offset(x: transform.pan.x, y: transform.pan.y)
 
-            // Trackpad phủ trọn ô giữa — gồm vùng đen letterbox quanh video: rê tay ở
-            // đâu cũng di được chuột (trackpad chạy theo delta). Con trỏ và toạ độ gửi
-            // đi vẫn bám khung video thật (overlay tự tính rect từ videoAspect).
-            if streaming {
-                TouchInputView(model: model, videoAspect: aspectRatio)
-            }
+                // Trackpad phủ trọn ô giữa — gồm vùng đen letterbox quanh video: rê tay ở
+                // đâu cũng di được chuột (trackpad chạy theo delta). Con trỏ và toạ độ gửi
+                // đi bám khung video thật, lấy từ `transform`.
+                if streaming {
+                    TouchInputView(model: model, transform: transform)
+                }
 
-            // View hứng phím: vô hình, chỉ tồn tại để giữ first responder.
-            // allowsHitTesting(false): không được nuốt cú chạm của lớp touch.
-            KeyInputView(model: model, active: $keyboardOn)
-                .frame(width: 1, height: 1)
-                .opacity(0)
-                .allowsHitTesting(false)
+                // View hứng phím: vô hình, chỉ tồn tại để giữ first responder.
+                // allowsHitTesting(false): không được nuốt cú chạm của lớp touch.
+                KeyInputView(model: model, active: $keyboardOn)
+                    .frame(width: 1, height: 1)
+                    .opacity(0)
+                    .allowsHitTesting(false)
 
-            // Lớp phủ trạng thái nằm TRONG ô video, không che hai thanh.
-            if !model.endReason.isEmpty {
-                endedOverlay
-            } else if !streaming {
-                connectingOverlay
+                // Lớp phủ trạng thái nằm TRONG ô video, không che hai thanh.
+                if !model.endReason.isEmpty {
+                    endedOverlay
+                } else if !streaming {
+                    connectingOverlay
+                }
             }
+            .frame(width: geo.size.width, height: geo.size.height)
+            // Khung đang phóng to TRÀN ra ngoài ô video — cắt đúng ở đây, kẻo nó đè
+            // lên thanh trạng thái và thanh phím tắt.
+            .clipped()
+            .onAppear {
+                transform.setViewport(geo.size)
+                transform.setAspect(aspectRatio)
+            }
+            .onChange(of: geo.size) { _, size in transform.setViewport(size) }
+            .onChange(of: aspectRatio) { _, value in transform.setAspect(value) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -197,6 +227,13 @@ struct StreamView: View {
                 // hỏi không có câu trả lời.
                 if model.sources.count > 1 {
                     Button("Display") { pickerOpen = true }
+                        .buttonStyle(.bordered)
+                }
+
+                // Đường về khi phóng sâu rồi lạc: chỉ hiện đúng lúc đang zoom, và nhãn
+                // mang luôn mức zoom hiện tại nên không cần thêm chỗ nào hiển thị nó.
+                if transform.zoomedIn {
+                    Button(String(format: "Fit %.1f×", Double(transform.zoom))) { transform.reset() }
                         .buttonStyle(.bordered)
                 }
 
