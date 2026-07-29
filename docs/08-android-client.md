@@ -156,9 +156,15 @@ matters, releasing held keys.)
   Tap = left click at the cursor, double-tap = right click, long-press-then-drag = left-button
   drag (mutually exclusive with plain drags by construction). The overlay fills the middle row
   of the screen — letterbox included — but not the status/button bars above and below it, so a
-  finger landing on a button no longer jogs the cursor. The cursor itself is clamped to the
-  actual video rect and positions are normalized to 0..65535 within it (`sendMouseMove` →
-  `QueueMouseMoveAbs`). It is mounted whenever the session is streaming.
+  finger landing on a button no longer jogs the cursor. It is mounted whenever the session is
+  streaming.
+
+  Since the zoom work (2026-07-29) the cursor is stored in **content space** — a 0..1 point on
+  the *host's* screen — and the on-screen position is derived through `VideoTransform`. What
+  is sent is simply `cursor × 65535`, so changing zoom or pan never nudges the host pointer,
+  and a finger delta divided by the *zoomed* frame width makes the cursor move slower the
+  further you zoom in (the precision mode zooming exists to provide). A move is still re-sent
+  immediately before every click so the click lands under the drawn cursor.
 - **Virtual keyboard** (`KeyInputView.kt`) — an invisible 1 dp view that holds IME focus and
   captures both input paths: `commitText`/`deleteSurroundingText` on a dummy
   `BaseInputConnection` (Gboard-style IMEs) and raw `onKeyDown` (physical/Bluetooth keyboards).
@@ -166,6 +172,32 @@ matters, releasing held keys.)
   codepoint goes through `nativeCharTap` → `QueueCharTap`, where core `CharToKeyChord`
   (US layout) expands it into `[Shift↓] key↓ key↑ [Shift↑]`; non-ASCII characters are silently
   dropped.
+- **Pinch zoom / pan** (`VideoZoom.kt`, added 2026-07-29) — two fingers pinch to magnify the
+  decoded frame (1× fit … 5×) and drag to move the viewport; a `Fit 2.3×` button in the bottom
+  bar appears only while zoomed and returns to fit. Nothing is sent to the host: this is purely
+  client-side magnification of pixels already received, since the agent always streams the
+  source at its native resolution (`AgentLoop` builds the offer straight from the source size
+  and ignores `HELLO.maxWidth/maxHeight`). It costs nothing either — the Surface buffer stays
+  at video resolution, only the destination rect grows, so the hardware composer does the
+  scaling.
+  - **One transform, two consumers.** `VideoTransform` holds `zoom`/`pan` and is read by both
+    the video frame and the trackpad; letting each compute its own rect would desync them the
+    moment zoom is non-1. The middle row measures the viewport once and feeds it in.
+  - **`VideoSurfaceHost`** is a real `FrameLayout` with `clipChildren`, because a zoomed
+    `SurfaceView` is *larger* than the middle row and Compose's `clipToBounds` cannot clip it —
+    the surface is a hole punched in the window by the View system, not something Compose
+    draws. It positions the `SurfaceView` by real layout (size + margins), not `scaleX`, since
+    the surface geometry is derived from the view's layout position.
+  - **Gesture arbitration.** The two-finger handler is a hand-written `awaitEachGesture` loop
+    that consumes only when ≥2 pointers are down; `detectTransformGestures` could not be used
+    because it consumes single-finger movement past touch slop, which would eat the cursor
+    drag. A first `pointerInput` counts pointers on the `Initial` pass and latches
+    `multiTouch` until a *new* gesture starts, so the lift that ends a pinch cannot be read as
+    a tap.
+  - **Cursor and viewport follow each other.** Moving the cursor near the edge auto-pans
+    (`ensureVisible`) — without it, zoomed-in regions of the host screen would be unreachable.
+    Panning by hand does the opposite (`clampToVisible`): the viewport is what the user asked
+    for, so the cursor gets pushed by the edge instead of yanking the view back.
 - **Hotkey row** — the `kHotkeys` list in `StreamActivity.kt` (Esc, Tab, Enter, arrows, Del,
   Ctrl+C, Ctrl+V) sends Windows virtual-key codes + scancodes (bit 8 = E0 flag) via
   `keyTap`/`keyChord`. Alt+Tab and the Win key are intentionally excluded (originally because
@@ -201,15 +233,16 @@ help text plus `Recents.kt`.
 
 Both screens now use **stock Material 3** (`MaterialTheme(colorScheme = darkColorScheme())`,
 `OutlinedTextField`, `Button`, `OutlinedButton`, `RadioButton`, `CircularProgressIndicator`,
-`Text`) with English literals inline. Around 1,400 lines of UI code went away; the four
-remaining Kotlin files are `MainActivity` (~290), `StreamActivity` (~600), `NativeClient`
-(~220) and `KeyInputView` (~94).
+`Text`) with English literals inline. Around 1,400 lines of UI code went away; the Kotlin
+files are `MainActivity` (~315), `StreamActivity` (~840), `NativeClient` (~220),
+`VideoZoom` (~300, added 2026-07-29 for pinch zoom) and `KeyInputView` (~94).
 
-What was **kept** because it is functional, not decoration: the SurfaceView + `aspectRatio`
-letterbox, `TrackpadOverlay` with its drawn `CursorArrow` (delta cursor, tap / double-tap /
-long-press-drag), the invisible `KeyInputView` that holds IME focus, and the horizontally
-scrolling hotkey row. The RTT sparkline went with the design system — the status line still
-shows the same numbers as text.
+What was **kept** because it is functional, not decoration: the SurfaceView and its letterbox
+(now computed by `VideoTransform.fitRect` instead of `Modifier.aspectRatio`, because the frame
+rect also depends on zoom/pan), `TrackpadOverlay` with its drawn `CursorArrow` (delta cursor,
+tap / double-tap / long-press-drag), the invisible `KeyInputView` that holds IME focus, and the
+horizontally scrolling hotkey row. The RTT sparkline went with the design system — the status
+line still shows the same numbers as text.
 
 ## Known limitations
 
@@ -217,7 +250,14 @@ shows the same numbers as text.
   pointer-lock, the Windows client's F9 mode) exist end-to-end but no UI calls them — the Lock
   button was removed.
 - Virtual-keyboard typing is limited to US-ASCII; anything `CharToKeyChord` cannot map is
-  dropped. No scroll-wheel or pinch-zoom gesture exists.
+  dropped. No scroll-wheel gesture exists (pinch zoom does, see Input).
+- **Zoom is client-side only**: it magnifies frames already decoded, so past ~1:1 with the
+  device's pixels it stops recovering detail and starts interpolating (which is why it is
+  capped at 5×). Streaming only the visible region — host-side crop, real detail at any
+  magnification, less bitrate — would need a new wire message plus a crop stage before NVENC
+  and an encoder rebuild per zoom step; deliberately not done. Rationale in `VideoZoom.kt`.
+- The zoom gesture is **iOS-less for now**: `TouchInputView.swift` still has no pinch
+  (`isMultipleTouchEnabled = false`), so the two mobile clients differ here until it is ported.
 - No host discovery (no mDNS/broadcast); the address is typed by hand (the last one is pre-filled).
 - One session at a time by design: a single global `ClientLoop` behind JNI.
 - No pause/resume — backgrounding terminates the session (see Lifecycle).

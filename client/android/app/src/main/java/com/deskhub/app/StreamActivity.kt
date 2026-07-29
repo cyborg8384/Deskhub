@@ -23,6 +23,11 @@
 //   "Display" ở thanh dưới (chỉ hiện khi có >1 nguồn) mở danh sách và đổi tại chỗ —
 //   xem StreamActivity.switchSource về lý do đổi = đóng phiên + mở phiên mới.
 //
+// ZOOM (2026-07-29)
+//   Hai ngón để phóng to và rê khung nhìn. Toàn bộ trạng thái + phép toán nằm ở
+//   VideoZoom.kt (VideoTransform), dùng CHUNG cho ô video và trackpad — hai bên tự
+//   tính riêng là lệch nhau ngay. Ô giữa đo viewport một lần rồi truyền xuống cả hai.
+//
 // ĐIỀU QUAN TRỌNG NHẤT (không đổi): KHUNG HÌNH KHÔNG ĐI QUA COMPOSE
 //   Compose chỉ lo phần chrome. Pixel của video đi thẳng từ bộ giải mã phần cứng ra
 //   màn hình qua hardware composer — SurfaceView chứ không phải TextureView
@@ -46,7 +51,6 @@ import android.content.Context
 import android.os.Build
 import android.os.Bundle
 import android.view.SurfaceHolder
-import android.view.SurfaceView
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import androidx.activity.ComponentActivity
@@ -54,6 +58,8 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -63,7 +69,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.offset
@@ -90,16 +95,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.isSpecified
-import androidx.compose.ui.geometry.isUnspecified
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.delay
@@ -263,6 +267,10 @@ private fun StreamScreen(
     var videoW by remember { mutableIntStateOf(0) }
     var videoH by remember { mutableIntStateOf(0) }
 
+    // Zoom/pan của khung hình. Ở ĐÂY chứ không nằm trong TrackpadOverlay vì cả ô
+    // video lẫn trackpad phải nhìn vào CÙNG một khung — xem VideoZoom.kt.
+    val transform = remember { VideoTransform() }
+
     // Hỏi trạng thái từ tầng C++ 500ms/lần. Rẻ hơn nhiều so với để C++ gọi ngược lên
     // JVM mỗi frame, và dòng số liệu chỉ đổi mỗi giây nên không cần nhanh hơn.
     //
@@ -275,12 +283,17 @@ private fun StreamScreen(
         endReason = ""
         videoW = 0
         videoH = 0
+        // Phiên mới (kể cả đổi màn hình) thì về lại vừa khung: nguồn mới có thể khác
+        // tỉ lệ, giữ zoom cũ là mở ra đã thấy một góc lạ hoắc.
+        transform.reset()
+        transform.setAspect(0f)
         if (!started) return@LaunchedEffect
         while (true) {
             phase = NativeClient.nativePhase()
             statusLine = NativeClient.nativeStatusLine()
             videoW = NativeClient.nativeVideoWidth()
             videoH = NativeClient.nativeVideoHeight()
+            transform.setAspect(if (videoW > 0 && videoH > 0) videoW.toFloat() / videoH else 0f)
             // Hết phiên thì thoát hẳn coroutine: lý do kết thúc không đổi nữa, hỏi
             // tiếp chỉ tốn pin. LaunchedEffect tự hủy coroutine khi rời màn hình.
             if (phase == NativeClient.PHASE_ENDED) {
@@ -365,33 +378,44 @@ private fun StreamScreen(
         }
 
         // --- Giữa: chỉ video (+ trackpad phủ đúng vùng này) ---
+        // Đo viewport ĐÚNG MỘT LẦN ở đây rồi cả ô video lẫn trackpad cùng đọc ra từ
+        // `transform` — letterbox không còn do Modifier.aspectRatio lo nữa, vì khung
+        // video giờ còn phụ thuộc zoom/pan.
         Box(
             modifier =
                 Modifier
                     .fillMaxWidth()
-                    .weight(1f),
+                    .weight(1f)
+                    .onSizeChanged { transform.setViewport(it) },
             contentAlignment = Alignment.Center,
         ) {
             if (started) {
-                // Modifier.aspectRatio lo luôn việc letterbox theo tỉ lệ video.
-                val aspect = if (videoW > 0 && videoH > 0) videoW.toFloat() / videoH else null
-                val videoModifier =
-                    if (aspect != null) Modifier.aspectRatio(aspect) else Modifier.fillMaxSize()
-
-                Box(modifier = videoModifier) {
-                    AndroidView(
-                        factory = { ctx ->
-                            SurfaceView(ctx).apply { holder.addCallback(holderCallback) }
-                        },
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                }
+                AndroidView(
+                    factory = { ctx -> VideoSurfaceHost(ctx, holderCallback) },
+                    // Đọc transform.videoRect ở đây: AndroidView chạy lại update khi
+                    // state đọc trong nó đổi, nên pinch/pan là chạy thẳng vào layout
+                    // của SurfaceView, không dựng lại view nào.
+                    update = { host ->
+                        val rect = transform.videoRect
+                        // Làm tròn theo hai MÉP rồi mới trừ ra bề rộng: làm tròn riêng
+                        // left và width thì mép phải nhảy 1px qua lại khi đang pinch.
+                        val left = rect.left.roundToInt()
+                        val top = rect.top.roundToInt()
+                        host.setVideoRect(
+                            left,
+                            top,
+                            rect.right.roundToInt() - left,
+                            rect.bottom.roundToInt() - top,
+                        )
+                    },
+                    modifier = Modifier.fillMaxSize(),
+                )
 
                 // Trackpad phủ trọn ô giữa — gồm cả vùng đen letterbox, nhưng KHÔNG
                 // còn chạm tới hai thanh: rê tay lên nút không làm con trỏ nhảy nữa.
                 if (streaming) {
                     TrackpadOverlay(
-                        videoAspect = aspect,
+                        transform = transform,
                         modifier = Modifier.fillMaxSize(),
                     )
                 }
@@ -425,6 +449,7 @@ private fun StreamScreen(
                 keyboardOn = keyboardOn,
                 sources = sources,
                 currentSourceId = currentSourceId,
+                transform = transform,
                 onToggleKeyboard = { keyboardOn = !keyboardOn },
                 onSwitchSource = onSwitchSource,
                 onEnd = onDismiss,
@@ -489,6 +514,7 @@ private fun BottomBar(
     keyboardOn: Boolean,
     sources: List<NativeClient.Source>,
     currentSourceId: Int,
+    transform: VideoTransform,
     onToggleKeyboard: () -> Unit,
     onSwitchSource: (Int) -> Unit,
     onEnd: () -> Unit,
@@ -544,6 +570,13 @@ private fun BottomBar(
             if (sources.size > 1) {
                 OutlinedButton(onClick = { pickerOpen = true }) { Text("Display") }
             }
+            // Đường về khi phóng sâu rồi lạc: chỉ hiện đúng lúc đang zoom, và nhãn
+            // mang luôn mức zoom hiện tại nên không cần thêm chỗ nào hiển thị nó.
+            if (transform.zoomedIn) {
+                OutlinedButton(onClick = { transform.reset() }) {
+                    Text("Fit %.1f×".format(transform.zoom))
+                }
+            }
             Box(modifier = Modifier.weight(1f))
             Button(onClick = onEnd) { Text("End") }
         }
@@ -597,56 +630,63 @@ private fun EndedOverlay(
  * ngón tay rê ở đâu cũng được — con trỏ dịch theo DELTA chứ không nhảy tới điểm
  * chạm (ngón tay không che mất chỗ cần bấm, và bấm được chính xác từng pixel).
  *
- *   Rê ngón       = di con trỏ.
+ *   Rê 1 ngón     = di con trỏ.
  *   Tap 1 lần     = click trái TẠI CON TRỎ.
  *   Tap 2 lần     = click phải tại con trỏ.
  *   Giữ rồi kéo   = giữ chuột trái và rê (kéo cửa sổ, bôi đen), nhấc tay là nhả.
+ *   2 ngón        = pinch phóng to / rê khung nhìn. Không gửi gì sang host; con trỏ
+ *                   bị mép khung đẩy theo nếu nó trôi ra ngoài vùng đang nhìn.
  *
- * Overlay phủ CẢ vùng hiển thị (gồm vùng đen letterbox), nhưng con trỏ bị kẹp
- * trong KHUNG VIDEO thật — rect tính từ `videoAspect` (aspect-fit, canh giữa) —
- * và toạ độ gửi đi chuẩn hoá 0..65535 theo rect đó qua [sendMouseMove].
+ * CON TRỎ LƯU Ở KHÔNG GIAN NỘI DUNG, KHÔNG PHẢI PIXEL MÀN HÌNH
+ *   `cursor` là toạ độ 0..1 trên MÀN HÌNH PC; chỗ vẽ nó là suy ra
+ *   (transform.contentToScreen) và toạ độ gửi đi chỉ là cursor × 65535. Hai cái lợi,
+ *   đều là bắt buộc khi có zoom:
+ *     - Đổi zoom/pan KHÔNG làm chuột bên PC nhúc nhích: nội dung có đổi đâu.
+ *     - Delta ngón tay chia cho bề rộng khung ĐÃ PHÓNG, nên phóng càng sâu con trỏ
+ *       đi càng chậm — đúng chế độ ngắm chính xác mà người ta zoom để có.
+ *
+ * Overlay phủ CẢ vùng hiển thị (gồm vùng đen letterbox); con trỏ bị kẹp trong
+ * 0..1 nên không bao giờ ra ngoài khung video thật.
  */
 @Composable
 private fun TrackpadOverlay(
-    videoAspect: Float?,
+    transform: VideoTransform,
     modifier: Modifier,
 ) {
-    var cursor by remember { mutableStateOf(Offset.Unspecified) }
-    // Khung đổi kích thước (xoay màn hình) -> kẹp con trỏ lại trong khung mới.
-    var bounds by remember { mutableStateOf(IntSize.Zero) }
+    var cursor by remember { mutableStateOf(Offset(0.5f, 0.5f)) }
+    // Chốt "cử chỉ đang diễn ra đã từng có ≥2 ngón" — xem pointerInput đầu tiên.
+    var multiTouch by remember { mutableStateOf(false) }
+    // Long-press drag có thật sự nhấn chuột xuống không: pinch chen ngang thì bỏ qua
+    // onDragStart, và khi đó onDragEnd cũng không được nhả một nút chưa hề nhấn.
+    var holdingLeft by remember { mutableStateOf(false) }
+    // Chừa mép để con trỏ không dính sát biên lúc auto-pan (xem ensureVisible).
+    val autoPanMarginPx = with(LocalDensity.current) { 40.dp.toPx() }
 
-    // Khung video thật bên trong overlay: aspect-fit canh giữa — trùng công thức
-    // letterbox của Modifier.aspectRatio bên ngoài.
-    fun videoRect(): Rect {
-        if (bounds.width <= 0 || bounds.height <= 0) return Rect.Zero
-        val bw = bounds.width.toFloat()
-        val bh = bounds.height.toFloat()
-        if (videoAspect == null || videoAspect <= 0f) return Rect(0f, 0f, bw, bh)
-        return if (bw / bh > videoAspect) {
-            val vw = bh * videoAspect // thừa ngang: video cao hết cỡ, đen hai bên
-            Rect((bw - vw) / 2f, 0f, (bw + vw) / 2f, bh)
-        } else {
-            val vh = bw / videoAspect // thừa dọc: video rộng hết cỡ, đen trên dưới
-            Rect(0f, (bh - vh) / 2f, bw, (bh + vh) / 2f)
-        }
+    fun send() {
+        NativeClient.mouseMove(
+            (cursor.x * 65535f).roundToInt(),
+            (cursor.y * 65535f).roundToInt(),
+        )
     }
 
     fun moveBy(delta: Offset) {
-        val rect = videoRect()
-        if (rect.width <= 0f || cursor.isUnspecified) return
+        val rect = transform.videoRect
+        if (rect.width <= 0f || rect.height <= 0f) return
         cursor =
             Offset(
-                (cursor.x + delta.x).coerceIn(rect.left, rect.right),
-                (cursor.y + delta.y).coerceIn(rect.top, rect.bottom),
+                (cursor.x + delta.x / rect.width).coerceIn(0f, 1f),
+                (cursor.y + delta.y / rect.height).coerceIn(0f, 1f),
             )
-        sendMouseMove(cursor, rect)
+        // Đang phóng to thì con trỏ dễ chạy ra ngoài phần đang nhìn thấy — kéo khung
+        // theo nó. Ở mức zoom = 1 pan luôn bị kẹp về 0 nên hàm này không làm gì.
+        transform.ensureVisible(cursor, autoPanMarginPx)
+        send()
     }
 
     // Host cũng có người dùng thật di chuột được — gửi lại vị trí con trỏ ngay
     // trước mỗi cú click để chắc chắn click rơi đúng chỗ con trỏ đang hiển thị.
     fun clickAt(button: Int) {
-        if (cursor.isUnspecified) return
-        sendMouseMove(cursor, videoRect())
+        send()
         NativeClient.mouseButton(button, true)
         NativeClient.mouseButton(button, false)
     }
@@ -654,31 +694,37 @@ private fun TrackpadOverlay(
     Box(
         modifier =
             modifier
-                .onSizeChanged { sz ->
-                    bounds = sz
-                    val rect = videoRect()
-                    cursor =
-                        if (cursor.isUnspecified) {
-                            rect.center
-                        } else {
-                            Offset(
-                                cursor.x.coerceIn(rect.left, rect.right),
-                                cursor.y.coerceIn(rect.top, rect.bottom),
-                            )
+                .pointerInput(Unit) {
+                    // Đếm ngón ở pass Initial (cha -> con): thấy MỌI sự kiện trước
+                    // khi bất kỳ nhánh nào tiêu thụ, nên các nhánh 1 ngón bên dưới
+                    // biết chắc chắn có đang pinch hay không.
+                    //
+                    // Chốt chỉ hạ khi một cử chỉ MỚI bắt đầu (0 ngón -> có ngón), chứ
+                    // không hạ lúc nhấc tay: cú nhấc tay kết thúc pinch mà bị coi là
+                    // gesture sạch thì detectTapGestures sẽ bắn ra một cú click.
+                    awaitPointerEventScope {
+                        var prevPressed = 0
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            val pressed = event.changes.count { it.pressed }
+                            if (prevPressed == 0 && pressed > 0) multiTouch = false
+                            if (pressed >= 2) multiTouch = true
+                            prevPressed = pressed
                         }
+                    }
                 }.pointerInput(Unit) {
                     // Có onDoubleTap nên onTap phải chờ hết cửa sổ double-tap
                     // (~300ms) mới nổ — giá phải trả để phân biệt được hai cử chỉ.
                     detectTapGestures(
-                        onTap = { clickAt(NativeClient.MOUSE_LEFT) },
-                        onDoubleTap = { clickAt(NativeClient.MOUSE_RIGHT) },
+                        onTap = { if (!multiTouch) clickAt(NativeClient.MOUSE_LEFT) },
+                        onDoubleTap = { if (!multiTouch) clickAt(NativeClient.MOUSE_RIGHT) },
                     )
                 }.pointerInput(Unit) {
                     // Rê tự do (không giữ nút nào): di con trỏ theo delta.
                     detectDragGestures(
                         onDrag = { change, delta ->
                             change.consume()
-                            moveBy(delta)
+                            if (!multiTouch) moveBy(delta)
                         },
                     )
                 }.pointerInput(Unit) {
@@ -687,26 +733,87 @@ private fun TrackpadOverlay(
                     // slop trước, bên này cần đứng yên trước — loại trừ lẫn nhau.
                     detectDragGesturesAfterLongPress(
                         onDragStart = {
-                            if (cursor.isSpecified) sendMouseMove(cursor, videoRect())
-                            NativeClient.mouseButton(NativeClient.MOUSE_LEFT, true)
+                            if (!multiTouch) {
+                                send()
+                                NativeClient.mouseButton(NativeClient.MOUSE_LEFT, true)
+                                holdingLeft = true
+                            }
                         },
                         onDrag = { change, delta ->
                             change.consume()
-                            moveBy(delta)
+                            if (holdingLeft) moveBy(delta)
                         },
                         onDragEnd = {
-                            NativeClient.mouseButton(NativeClient.MOUSE_LEFT, false)
+                            if (holdingLeft) {
+                                NativeClient.mouseButton(NativeClient.MOUSE_LEFT, false)
+                                holdingLeft = false
+                            }
                         },
                         onDragCancel = {
-                            NativeClient.mouseButton(NativeClient.MOUSE_LEFT, false)
+                            if (holdingLeft) {
+                                NativeClient.mouseButton(NativeClient.MOUSE_LEFT, false)
+                                holdingLeft = false
+                            }
                         },
                     )
+                }.pointerInput(Unit) {
+                    // HAI NGÓN: pinch = zoom, rê = dời khung nhìn. Tự viết vòng lặp
+                    // chứ không dùng detectTransformGestures vì hàm đó tiêu thụ cả
+                    // chuyển động MỘT ngón sau khi vượt touch slop — dùng nó là mất
+                    // luôn đường di con trỏ. Ở đây chỉ tiêu thụ khi thật sự có ≥2 ngón.
+                    //
+                    // Đặt CUỐI chuỗi modifier: pass Main đi từ con ra cha, nên nhánh
+                    // này được xử lý trước và các nhánh 1 ngón ở trên thấy sự kiện đã
+                    // bị tiêu thụ mà tự huỷ.
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false)
+                        var prevCentroid = Offset.Unspecified
+                        var prevSpread = 0f
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val points = event.changes.filter { it.pressed }
+                            if (points.size < 2) {
+                                // Nhấc bớt còn 1 ngón: quên mốc cũ, đừng để cú rê tiếp
+                                // theo bị tính như một bước pinch khổng lồ.
+                                prevCentroid = Offset.Unspecified
+                                prevSpread = 0f
+                                if (points.isEmpty()) break
+                                continue
+                            }
+                            val centroid =
+                                points.fold(Offset.Zero) { acc, p -> acc + p.position } /
+                                    points.size.toFloat()
+                            val spread =
+                                points.fold(0f) { acc, p -> acc + (p.position - centroid).getDistance() } /
+                                    points.size
+                            if (prevCentroid.isSpecified) {
+                                if (prevSpread > 0f && spread > 0f) {
+                                    transform.zoomBy(spread / prevSpread, centroid)
+                                }
+                                transform.panBy(centroid - prevCentroid)
+                                // Khung là ý muốn của người dùng, con trỏ mới là thứ
+                                // phải nhường: để nó bị mép khung đẩy đi thay vì kéo
+                                // khung về theo nó. KHÔNG gửi gì — chuột bên PC chỉ
+                                // nhúc nhích khi người dùng thật sự rê/bấm, và lúc đó
+                                // toạ độ tuyệt đối được gửi kèm nên hai bên không lệch.
+                                cursor = transform.clampToVisible(cursor, autoPanMarginPx)
+                            }
+                            prevCentroid = centroid
+                            prevSpread = spread
+                            points.forEach { it.consume() }
+                        }
+                    }
                 },
     ) {
-        if (cursor.isSpecified) {
+        // Chưa đo được ô video thì chưa biết vẽ con trỏ ở đâu — vẽ sớm là nó nháy
+        // một frame ở góc trên-trái.
+        if (transform.viewport.width > 0) {
             CursorArrow(
                 modifier =
-                    Modifier.offset { IntOffset(cursor.x.roundToInt(), cursor.y.roundToInt()) },
+                    Modifier.offset {
+                        val p = transform.contentToScreen(cursor)
+                        IntOffset(p.x.roundToInt(), p.y.roundToInt())
+                    },
             )
         }
     }
@@ -732,16 +839,4 @@ private fun CursorArrow(modifier: Modifier) {
         drawPath(p, Color.White)
         drawPath(p, Color.Black, style = Stroke(width = 1.dp.toPx()))
     }
-}
-
-// Chuẩn hoá vị trí con trỏ theo KHUNG VIDEO (không phải cả overlay) rồi gửi.
-private fun sendMouseMove(
-    pos: Offset,
-    rect: Rect,
-) {
-    if (rect.width <= 0f || rect.height <= 0f) return
-    NativeClient.mouseMove(
-        (((pos.x - rect.left) / rect.width) * 65535f).roundToInt(),
-        (((pos.y - rect.top) / rect.height) * 65535f).roundToInt(),
-    )
 }
